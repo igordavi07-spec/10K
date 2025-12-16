@@ -7,9 +7,13 @@ import GrowthTable from './components/GrowthTable';
 import RiskWarning from './components/RiskWarning';
 import DailyInput from './components/DailyInput';
 import HistoryLog from './components/HistoryLog';
-import { Activity, Calendar, Award, AlertOctagon, ListOrdered } from 'lucide-react';
+import { Activity, Calendar, Award, AlertOctagon, ListOrdered, RefreshCw } from 'lucide-react';
+import { supabase } from './lib/supabaseClient';
 
 const App: React.FC = () => {
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
   // Config state
   const [config, setConfig] = useState<PlanConfig>({
     initialBalance: 150,
@@ -34,42 +38,120 @@ const App: React.FC = () => {
 
   const riskAnalysis = useMemo(() => analyzeRisk(currentBalance, config.lossAmount), [currentBalance, config.lossAmount]);
 
-  // Derived Values
   const totalDays = projection.length;
-  const daysRemaining = Math.max(0, totalDays - currentPlanDay);
   const progressPercent = Math.min(100, (currentPlanDay / totalDays) * 100);
-  
-  // Get today's goal based on the projected plan day
-  // If we are at Day 5, we want to achieve the growth for Day 5
   const currentPlanData = projection.find(p => p.day === currentPlanDay) || projection[0];
   const dailyGoalValue = currentBalance * (config.dailyPercentage / 100);
 
-  // Reset current balance if user changes initial balance drastically (optional safety, or just sync)
-  useEffect(() => {
-    // If history is empty, sync current balance with config initial
-    if (history.length === 0) {
-      setCurrentBalance(config.initialBalance);
-    } else {
-      // If config changes, we should technically recalculate history based on new initial balance
-      // but to preserve user data integrity we trigger a recalculation
-      recalculateHistoryChain(history, config.initialBalance);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [config.initialBalance]);
+  // --- SUPABASE INTEGRATION ---
 
-  // CORE FUNCTION: Recalculates the entire timeline to ensure math is always consistent
+  // 1. Fetch Data on Mount
+  useEffect(() => {
+    const fetchData = async () => {
+      setLoading(true);
+      try {
+        // Fetch Config
+        const { data: configData, error: configError } = await supabase
+          .from('plan_config')
+          .select('*')
+          .single(); // Assuming single user/single config for now
+
+        if (configData && !configError) {
+          setConfig({
+            initialBalance: configData.initial_balance,
+            targetBalance: configData.target_balance,
+            winAmount: configData.win_amount,
+            lossAmount: configData.loss_amount,
+            dailyPercentage: configData.daily_percentage,
+            maxTradesPerDay: configData.max_trades_per_day
+          });
+        }
+
+        // Fetch History
+        const { data: historyData, error: historyError } = await supabase
+          .from('trade_history')
+          .select('*')
+          .order('date', { ascending: true }); // Oldest first to calculate chain
+
+        if (historyData && !historyError) {
+          // Map snake_case to camelCase
+          const mappedHistory: TradeHistory[] = historyData.map((item: any) => ({
+            id: item.id,
+            date: item.date,
+            resultValue: item.result_value,
+            // These calculated fields might be stale in DB, we will recalculate them below
+            startBalance: item.start_balance,
+            endBalance: item.end_balance,
+            startPlanDay: item.start_plan_day,
+            endPlanDay: item.end_plan_day,
+            dayShift: item.day_shift
+          }));
+          
+          // Important: Recalculate chain using the config we just loaded (or default)
+          const startBal = configData ? configData.initial_balance : 150;
+          recalculateHistoryChain(mappedHistory, startBal);
+        } else {
+           // If no history, just sync balance
+           setCurrentBalance(configData ? configData.initial_balance : 150);
+        }
+
+      } catch (error) {
+        console.error("Error loading data:", error);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchData();
+  }, []);
+
+  // 2. Save Config Debounced
+  useEffect(() => {
+    if (loading) return;
+
+    const timer = setTimeout(async () => {
+      setSaving(true);
+      const { error } = await supabase
+        .from('plan_config')
+        .upsert({
+          id: 1, // Force singleton row
+          initial_balance: config.initialBalance,
+          target_balance: config.targetBalance,
+          win_amount: config.winAmount,
+          loss_amount: config.lossAmount,
+          daily_percentage: config.dailyPercentage,
+          max_trades_per_day: config.maxTradesPerDay
+        });
+      
+      if (error) console.error("Error saving config", error);
+      setSaving(false);
+      
+      // When config changes (e.g. initial balance), we must recalculate history
+      recalculateHistoryChain(history, config.initialBalance);
+
+    }, 1000); // Save 1s after last change
+
+    return () => clearTimeout(timer);
+  }, [config]);
+
+
+  // CORE FUNCTION: Recalculates the entire timeline
+  // Now simpler: it just updates state. The persistence happens in the event handlers.
   const recalculateHistoryChain = (currentHistory: TradeHistory[], startBal: number) => {
     let runningBalance = startBal;
     
-    // We need to use the current projection logic
-    const currentProjection = calculateProjection(config);
+    // Use current (or passed) config for projection logic
+    // Note: If config state isn't updated yet, this might use old config. 
+    // Ideally calculateProjection should take the startBal passed in.
+    const tempConfig = { ...config, initialBalance: startBal }; 
+    const currentProjection = calculateProjection(tempConfig);
 
     const updatedHistory = currentHistory.map(trade => {
        const startBalance = runningBalance;
        const endBalance = startBalance + trade.resultValue;
        
-       const startPlanDay = findPlanDay(startBalance, currentProjection, config.initialBalance);
-       const endPlanDay = findPlanDay(endBalance, currentProjection, config.initialBalance);
+       const startPlanDay = findPlanDay(startBalance, currentProjection, startBal);
+       const endPlanDay = findPlanDay(endBalance, currentProjection, startBal);
        
        runningBalance = endBalance;
        
@@ -87,31 +169,79 @@ const App: React.FC = () => {
     setCurrentBalance(runningBalance);
   };
 
-  const handleFinishDay = (result: number) => {
-    // Simple ID generator fallback
-    const newId = Math.random().toString(36).substring(2, 11);
-    
-    const newEntry: TradeHistory = {
-      id: newId,
-      date: new Date().toISOString(),
-      startBalance: 0, // Placeholder, will be calculated
-      resultValue: result,
-      endBalance: 0, // Placeholder
-      startPlanDay: 0,
-      endPlanDay: 0,
-      dayShift: 0
-    };
+  // --- HANDLERS (With Supabase) ---
 
-    recalculateHistoryChain([...history, newEntry], config.initialBalance);
+  const handleFinishDay = async (result: number) => {
+    // 1. Optimistic Update (Optional) - skipped for simplicity, we wait for DB ID
+    
+    // 2. Insert into Supabase
+    const { data, error } = await supabase
+      .from('trade_history')
+      .insert({
+        date: new Date().toISOString(),
+        result_value: result,
+        // We insert 0s for calc fields, they are derived in frontend mostly
+        start_balance: currentBalance,
+        end_balance: currentBalance + result,
+        start_plan_day: 0,
+        end_plan_day: 0,
+        day_shift: 0
+      })
+      .select()
+      .single();
+
+    if (error) {
+      alert("Erro ao salvar dados.");
+      console.error(error);
+      return;
+    }
+
+    if (data) {
+      // 3. Update Local State & Recalculate
+      const newEntry: TradeHistory = {
+        id: data.id, // UUID from Supabase
+        date: data.date,
+        resultValue: data.result_value,
+        startBalance: 0, // Will be calc'd
+        endBalance: 0,
+        startPlanDay: 0,
+        endPlanDay: 0,
+        dayShift: 0
+      };
+      recalculateHistoryChain([...history, newEntry], config.initialBalance);
+    }
   };
 
-  const handleDeleteHistory = (id: string) => {
-    // Removed window.confirm to ensure action executes immediately
+  const handleDeleteHistory = async (id: string) => {
+    // 1. Delete from Supabase
+    const { error } = await supabase
+      .from('trade_history')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+      console.error("Error deleting", error);
+      return;
+    }
+
+    // 2. Update Local
     const newHistory = history.filter(item => item.id !== id);
     recalculateHistoryChain(newHistory, config.initialBalance);
   };
 
-  const handleEditHistory = (id: string, newResult: number) => {
+  const handleEditHistory = async (id: string, newResult: number) => {
+    // 1. Update Supabase
+    const { error } = await supabase
+      .from('trade_history')
+      .update({ result_value: newResult })
+      .eq('id', id);
+
+    if (error) {
+      console.error("Error updating", error);
+      return;
+    }
+
+    // 2. Update Local
     const newHistory = history.map(item => {
       if (item.id === id) {
         return { ...item, resultValue: newResult };
@@ -121,6 +251,14 @@ const App: React.FC = () => {
     
     recalculateHistoryChain(newHistory, config.initialBalance);
   };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center text-emerald-500">
+        <RefreshCw className="animate-spin mr-2" /> Carregando seus dados...
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 font-sans selection:bg-emerald-500/30">
@@ -135,6 +273,7 @@ const App: React.FC = () => {
             </h1>
           </div>
           <div className="flex items-center gap-3">
+             {saving && <span className="text-xs text-slate-500 animate-pulse">Salvando...</span>}
              <div className="text-right hidden sm:block">
                 <p className="text-xs text-slate-400">Banca Atual</p>
                 <p className="text-lg font-bold text-white leading-none">{formatCurrency(currentBalance)}</p>
